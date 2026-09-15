@@ -1,0 +1,319 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<!DOCTYPE rfc [
+  <!ENTITY nbsp    "&#160;">
+  <!ENTITY zwsp   "&#8203;">
+  <!ENTITY nbhy   "&#8209;">
+  <!ENTITY wj     "&#8288;">
+  <!ENTITY RFC.2119 SYSTEM "https://bib.ietf.org/public/rfc/bibxml/reference.RFC.2119.xml">
+  <!ENTITY RFC.8174 SYSTEM "https://bib.ietf.org/public/rfc/bibxml/reference.RFC.8174.xml">
+  <!ENTITY RFC.9293 SYSTEM "https://bib.ietf.org/public/rfc/bibxml/reference.RFC.9293.xml">
+  <!ENTITY I-D.bonica-tcpm-extended-options SYSTEM "https://bib.ietf.org/public/rfc/bibxml3/reference.I-D.bonica-tcpm-extended-options.xml">
+]>
+
+<rfc
+  xmlns:xi="http://www.w3.org/2001/XInclude"
+  category="info"
+  docName="draft-parikh-large-tcp-options-selection-algo-00"
+  ipr="trust200902"
+  obsoletes=""
+  updates=""
+  submissionType="IETF"
+  xml:lang="en"
+  version="3">
+
+  <front>
+    <title abbrev="Chonky or Smol Options?">A Selection Algorithm for Concurrent TCP Option (SEG-U and SEG-O) Size Requests</title>
+
+    <seriesInfo name="Internet-Draft" value="draft-parikh-large-tcp-options-selection-algo-00"/>
+
+    <author fullname="Jainam Parikh" initials="J" surname="Parikh">
+      <organization>Arista Networks</organization>
+      <address>
+        <postal>
+          <city>Santa Clara</city>
+          <region>California</region>
+          <country>USA</country>
+        </postal>
+        <email>jainam@parikhgroup.net</email>
+      </address>
+    </author>
+
+    <author fullname="Ron Bonica" initials="R" surname="Bonica">
+      <organization>HPE Juniper</organization>
+      <address>
+        <postal>
+          <city>Herndon</city>
+          <region>Virginia</region>
+          <country>USA</country>
+        </postal>
+        <email>ronald.bonica@hpe.com</email>
+      </address>
+    </author>
+
+    <date year="2026"/>
+
+    <area>Transport</area>
+    <workgroup>Internet Engineering Task Force</workgroup>
+
+    <keyword>TCP</keyword>
+    <keyword>SEG-U</keyword>
+    <keyword>SEG-O</keyword>
+    <keyword>extended options</keyword>
+    <keyword>selection algorithm</keyword>
+
+    <abstract>
+      <t> 
+        <xref target="I-D.bonica-tcpm-extended-options"/> defines an Upgraded
+        TCP Segment (SEG-U) which can carry up to 1016 octets of TCP options,
+        by setting the Data Offset field to 0, and introducing a "length" field.
+        Given that the TCP-U is designed to be backwards compatible with TCP-O, 
+        hosts which supports this new TCP-U, are expected to support both segment
+        formats, SEG-U and SEG-O. So, there is a chance, that during connection
+        setup, the host receive requests for either. When such requests arrive
+        concurrently (or successively), for what would otherwise be the same
+        session, the host must decide which format to accept and which to decline.
+      </t>
+      <t>
+        This document defines an algorithm for dual-capable hosts to select
+        between a TCP-U and a TCP-O when presented with both. It specifies
+        selection inputs, tie-breaking, fallback behaviour, and the interaction
+        with the existing TCP state machine.
+      </t>
+    </abstract>
+
+  </front>
+
+  <middle>
+
+    <section>
+      <name>Terminology</name>
+      <dl newline="false">
+        <dt>SEG-U:</dt>
+        <dd>Upgraded TCP Segment, as defined in
+          <xref target="I-D.bonica-tcpm-extended-options"/>.  Marked by
+          <tt>Data Offset == 0</tt>; carries an options region of up to
+          1016&nbsp;octets.</dd>
+        <dt>SEG-O:</dt>
+        <dd>Original (classic) TCP Segment.  Options region capped at
+          40&nbsp;octets.</dd>
+        <dt>SES-U:</dt>
+        <dd>A TCP session in which both peers have agreed to exchange
+          SEG-U.</dd>
+        <dt>SES-O:</dt>
+        <dd>A TCP session in which both peers exchange only SEG-O.</dd>
+        <dt>TCP-O:</dt>
+        <dd>TCP that supports SEG-O.</dd>
+        <dt>TCP-U:</dt>
+        <dd>TCP that supports SEG-U.</dd>
+        <dt>Dual-capable host:</dt>
+        <dd>A host that implements both SEG-U and SEG-O and is willing to
+          establish either kind of session.</dd>
+        <dt>Selection event:</dt>
+        <dd>The moment at which a dual-capable host must commit to SEG-U or
+          SEG-O for a given (prospective) session.</dd>
+      </dl>
+    </section>
+
+    <section>
+      <name>Introduction</name>
+      <t>
+        The Upgraded TCP Segment (SEG-U) format defined in
+        <xref target="I-D.bonica-tcpm-extended-options"/> raises the TCP
+        options ceiling from 40 octets to 1016 octets by repurposing the Data
+        Offset field: A value of zero marks a segment as SEG-U rather than
+        classic TCP (SEG-O). Legacy stacks reject <tt>dataofs &lt; 5</tt> and
+        therefore drop SEG-U silently, giving the format implicit backwards
+        compatibility.
+      </t>
+      <t>
+        Hosts that implements both SEG-U and SEG-O can, in the course of
+        normal operation, be offered either kind of session.  In some
+        deployments the same peer (or two peers acting on behalf of the same
+        application) may present both a SEG-U and a SEG-O initiation for what
+        the host would treat as a single session.  Without a procedure, the
+        outcome is implementation-dependent and may vary between stacks,
+        defeating the interoperability goals of
+        <xref target="I-D.bonica-tcpm-extended-options"/>.
+      </t>
+      <t>
+        This document specifies a deterministic selection algorithm for such
+        hosts. It does not change the SEG-U or SEG-O wire formats and does
+        not alter the classic TCP three-way handshake beyond the point at
+        which the host commits to one format or the other.
+      </t>
+
+      <section anchor="requirements">
+        <name>Requirements Language</name>
+        <t>The key words "MUST", "MUST NOT", "REQUIRED", "SHALL",
+          "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT
+          RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be
+          interpreted as described in BCP&nbsp;14 <xref target="RFC2119"/>
+          <xref target="RFC8174"/> when, and only when, they appear in
+          all capitals, as shown here.</t>
+      </section>
+    </section>
+
+    <section>
+      <name>Problem Statement</name>
+      <t>
+       !.ADD INFO.!
+      </t>
+
+      <section>
+        <name>IPv4 or IPv6 hanlding</name>
+        <t>
+          !.ADD INFO.!
+        </t>
+      </section>
+
+      <section>
+        <name>Successive SYN Arrivals Within a Window</name>
+        <t>
+          !.ADD INFO.!
+        </t>
+      </section>
+
+      <section>
+        <name>Ambiguity Introduced by Middleboxes</name>
+        <t>
+          !.ADD INFO.!
+        </t>
+      </section>
+    </section>
+
+    <section>
+      <name>Selection Inputs/Guidelines</name>
+      <t>
+        A conforming implementation MAY consider any of the following inputs
+        when running the selection algorithm.  This list is non-exhaustive and
+        does not prescribe an ordering; the ordering is defined in
+        <xref target="algorithm"/>.
+      </t>
+      <ul spacing="normal">
+        <li>[Input 1 — e.g., size of the options region actually carried in
+          each SYN.]</li>
+        <li>[Input 2 — e.g., presence or absence of specific option kinds.]</li>
+        <li>[Input 3 — e.g., local policy / administrative preference.]</li>
+        <li>[Input 4 — e.g., arrival order or timing.]</li>
+      </ul>
+
+      <t>
+        !.ADD INFO.!
+        Issue #2, #3 and #4 on GitHub
+      </t>
+
+    </section>
+
+    <section anchor="algorithm">
+      <name>Selection Algorithm</name>
+      <t>
+        !.ADD INFO.!
+      </t>
+    </section>
+
+    <section>
+      <name>Handshake Behaviour After Selection</name>
+      <t>
+        !.ADD INFO.!
+        [Describe what happens to the losing SYN: silently dropped,
+        explicitly RST'd, or held for a grace period.  Describe how the
+        winning handshake proceeds, this SHOULD be unchanged from
+        <xref target="I-D.bonica-tcpm-extended-options"/> once the format
+        is chosen.]
+      </t>
+    </section>
+
+    <section>
+      <name>Interaction with the TCP State Machine</name>
+      <t>
+        [Describe how the selection event fits alongside LISTEN,
+        SYN-RECEIVED, and simultaneous-open semantics from
+        <xref target="RFC9293"/>.]
+        IS this needed? Question for self.
+      </t>
+    </section>
+
+    <section>
+      <name>Worked Examples</name>
+      <t>
+        Attach the <xref target="TCP-U-POC"/>
+      </t>
+
+      <figure>
+        <name>XYZ</name>
+        <artwork type="ascii-art" name="example-segu-wins.txt">
+          <![CDATA[
+[TBD ladder diagram]
+          ]]>
+        </artwork>
+      </figure>
+
+      <figure>
+        <name>XYZ</name>
+        <artwork type="ascii-art" name="example-sego-wins.txt">
+          <![CDATA[
+[TBD ladder diagram]
+          ]]>
+        </artwork>
+      </figure>
+    </section>
+
+    <section>
+      <name>Operational Considerations</name>
+      <t>
+        Need to think about this: Logging, observability, knobs administrators 
+        may want to expose, interaction with connection-tracking middleboxes.
+      </t>
+    </section>
+
+    <section anchor="IANA">
+      <name>IANA Considerations</name>
+      <t>This memo includes no request to IANA.</t>
+    </section>
+
+    <section anchor="Security">
+      <name>Security Considerations</name>
+      <t>
+        TBD
+      </t>
+    </section>
+
+  </middle>
+
+  <back>
+    <references>
+      <name>References</name>
+
+      <references>
+        <name>Normative References</name>
+        &RFC.2119;
+        &RFC.8174;
+        &RFC.9293;
+      </references>
+
+      <references>
+        <name>Informative References</name>
+
+        &I-D.bonica-tcpm-extended-options;
+
+        <reference anchor="TCP-U-POC" target="https://github.com/jmparikh/tcp-u-poc">
+          <front>
+            <title>TCP Extended Options (SEG-U) Proof of Concept</title>
+            <author>
+              <organization>Parikh, J.</organization>
+            </author>
+            <date year="2026"/>
+          </front>
+        </reference>
+
+      </references>
+    </references>
+
+    <section anchor="Acknowledgements" numbered="false">
+      <name>Acknowledgements</name>
+      <t>[TBD]</t>
+    </section>
+
+  </back>
+</rfc>
